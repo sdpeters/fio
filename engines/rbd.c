@@ -22,8 +22,11 @@
 struct fio_rbd_iou {
 	struct io_u *io_u;
 	rbd_completion_t completion;
+	rbd_completion_t flush_completion;
 	int io_seen;
 	int io_complete;
+    int flush_dispatched;
+    struct rbd_data *rbd_data;
 #ifdef CONFIG_RBD_BLKIN
 	struct blkin_trace_info info;
 #endif
@@ -277,11 +280,26 @@ static void _fio_rbd_disconnect(struct rbd_data *rbd)
 	}
 }
 
+static void _fio_rbd_finish_flush_aiocb(rbd_completion_t comp, void *data)
+{
+	struct fio_rbd_iou *fri = data;
+	struct io_u *io_u = fri->io_u;
+	ssize_t ret;
+
+	ret = rbd_aio_get_return_value(fri->flush_completion);
+	if (ret < 0) {
+        log_err("rbd_aio_create_completion failed.\n");
+		io_u->error = -ret;
+    }
+    fri->io_complete = 1;
+}
+
 static void _fio_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 {
 	struct fio_rbd_iou *fri = data;
 	struct io_u *io_u = fri->io_u;
 	ssize_t ret;
+    int r = -1;
 
 	/*
 	 * Looks like return value is 0 for success, or < 0 for
@@ -292,10 +310,32 @@ static void _fio_rbd_finish_aiocb(rbd_completion_t comp, void *data)
 	if (ret < 0) {
 		io_u->error = -ret;
 		io_u->resid = io_u->xfer_buflen;
-	} else
+	} else {
 		io_u->error = 0;
+    }
+    
+    /* For barrier writes, issue flush and complete write when flush completes */
+    if (io_u->flags & IO_U_F_BARRIER) {
+        r = rbd_aio_create_completion(fri, _fio_rbd_finish_flush_aiocb,
+                                      &fri->flush_completion);
+        if (r < 0) {
+            log_err("rbd_aio_create_completion failed.\n");
+            io_u->error = -r;
+            fri->io_complete = 1;
+            return;
+        }
 
-	fri->io_complete = 1;
+        fri->flush_dispatched = 1;
+        r = rbd_aio_flush(fri->rbd_data->image, fri->flush_completion);
+		if (r < 0) {
+			log_err("rbd_aio_flush failed.\n");
+            io_u->error = -r;
+            fri->io_complete = 1;
+            return;
+		}
+    } else {
+        fri->io_complete = 1;
+    }
 }
 
 static struct io_u *fio_rbd_event(struct thread_data *td, int event)
@@ -316,6 +356,9 @@ static inline int fri_check_complete(struct rbd_data *rbd, struct io_u *io_u,
 		(*events)++;
 
 		rbd_aio_release(fri->completion);
+        if (fri->flush_dispatched) {
+            rbd_aio_release(fri->flush_completion);
+        }
 		return 1;
 	}
 
@@ -465,7 +508,9 @@ static int fio_rbd_queue(struct thread_data *td, struct io_u *io_u)
 
 	fri->io_seen = 0;
 	fri->io_complete = 0;
-
+    fri->flush_dispatched = 0;
+    fri->flush_completion = NULL;
+    
 	r = rbd_aio_create_completion(fri, _fio_rbd_finish_aiocb,
 						&fri->completion);
 	if (r < 0) {
@@ -655,9 +700,11 @@ static void fio_rbd_io_u_free(struct thread_data *td, struct io_u *io_u)
 static int fio_rbd_io_u_init(struct thread_data *td, struct io_u *io_u)
 {
 	struct fio_rbd_iou *fri;
+	struct rbd_data *rbd = td->io_ops_data;
 
 	fri = calloc(1, sizeof(*fri));
 	fri->io_u = io_u;
+    fri->rbd_data = rbd;
 	io_u->engine_data = fri;
 	return 0;
 }
@@ -677,6 +724,7 @@ static struct ioengine_ops ioengine = {
 	.io_u_init		= fio_rbd_io_u_init,
 	.io_u_free		= fio_rbd_io_u_free,
 	.option_struct_size	= sizeof(struct rbd_options),
+    .flags          = FIO_BARRIER,
 };
 
 static void fio_init fio_rbd_register(void)
